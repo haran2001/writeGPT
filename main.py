@@ -4,104 +4,142 @@ import openai
 import numpy as np
 import pdfplumber
 from docx import Document
-from sentence_transformers import SentenceTransformer
+from typing import List, Tuple, Dict  # <-- Import generic types from typing
+from dotenv import load_dotenv
+from config import OPENAI_API_KEY
 
-#######################################
+################################################
 # Configuration
-#######################################
-
+################################################
+openai.api_key = OPENAI_API_KEY
 OPENAI_MODEL = "gpt-3.5-turbo"
 PLACEHOLDER_PATTERN = r"\{\{(.*?)\}\}"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+CHUNK_SIZE = 50  # Approximate chunk size in characters for splitting
+USER_INSTRUCTIONS = (
+    "Use a professional tone, summarize key points clearly, "
+    "and maintain relevant context. Preserve the template's structure.\n\n"
+    "If references are missing or insufficient, provide a best-effort summary "
+    "or note that more data was not found."
+)
 
-# User-provided instructions (could be dynamic)
-USER_INSTRUCTIONS = "Use a professional tone, summarize key points clearly, and maintain the formatting context."
-
-#######################################
-# Functions
-#######################################
-
-
-def load_template(template_path: str) -> Document:
-    """Load the DOCX template."""
-    return Document(template_path)
+################################################
+# Agent Definitions
+################################################
 
 
-def extract_placeholders_from_template(doc: Document):
-    """Extract placeholders from the DOCX template.
-
-    Searches paragraph text and also table cells if needed.
+class DocumentIngestionAgent:
     """
-    placeholders = set()
-    # Check paragraphs
-    for p in doc.paragraphs:
-        matches = re.findall(PLACEHOLDER_PATTERN, p.text)
-        for m in matches:
-            placeholders.add(m.strip())
+    Agent responsible for loading raw documents from disk in various formats
+    (TXT, MD, PDF) and returning raw text content.
+    """
 
-    # Check tables (if any)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                matches = re.findall(PLACEHOLDER_PATTERN, cell.text)
-                for m in matches:
-                    placeholders.add(m.strip())
+    def __init__(self, doc_dir: str):
+        self.doc_dir = doc_dir
 
-    return list(placeholders)
+    def run(self) -> List[str]:
+        """
+        Scans the directory, reads each supported file, and returns a list of texts.
+        """
+        texts: List[str] = []
+        for filename in os.listdir(self.doc_dir):
+            path = os.path.join(self.doc_dir, filename)
+            if filename.lower().endswith((".txt", ".md")):
+                with open(path, "r", encoding="utf-8") as f:
+                    texts.append(f.read())
+            elif filename.lower().endswith(".pdf"):
+                pdf_text = self._extract_text_from_pdf(path)
+                if pdf_text.strip():
+                    texts.append(pdf_text)
+        return texts
 
-
-def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract text from a PDF file using pdfplumber."""
-    text_content = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text_content.append(page_text)
-    return "\n".join(text_content)
-
-
-def load_input_documents(doc_dir: str):
-    """Load reference documents (TXT/MD/PDF) from a directory."""
-    texts = []
-    for filename in os.listdir(doc_dir):
-        path = os.path.join(doc_dir, filename)
-        if filename.lower().endswith((".txt", ".md")):
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-                texts.append(text)
-        elif filename.lower().endswith(".pdf"):
-            pdf_text = extract_text_from_pdf(path)
-            if pdf_text.strip():
-                texts.append(pdf_text)
-    return texts
+    def _extract_text_from_pdf(self, pdf_path: str) -> str:
+        """
+        Extract text from a PDF file using pdfplumber.
+        """
+        text_content: List[str] = []
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_content.append(page_text)
+        return "\n".join(text_content)
 
 
-def create_embedding_index(docs):
-    """Create embeddings for the reference documents."""
-    embeddings = model.encode(docs, convert_to_numpy=True, normalize_embeddings=True)
-    return embeddings
+class ChunkingEmbeddingAgent:
+    """
+    Agent that chunks documents and creates embeddings for each chunk.
+    This enables more granular retrieval rather than using the entire document as a single block.
+    """
+
+    def __init__(self, chunk_size: int = CHUNK_SIZE):
+        self.chunk_size = chunk_size
+
+    def run(self, docs: List[str]) -> Tuple[List[str], np.ndarray]:
+        """
+        Splits each doc into chunks of size `chunk_size`, creates embeddings,
+        and returns (list_of_chunks, embeddings_array).
+        """
+        all_chunks: List[str] = []
+        for doc_text in docs:
+            start = 0
+            while start < len(doc_text):
+                end = start + self.chunk_size
+                chunk = doc_text[start:end]
+                all_chunks.append(chunk)
+                start = end
+
+        # Generate embeddings for each chunk
+        embeddings = openai_embeddings(
+            all_chunks
+        )  # We'll define openai_embeddings below OR use the embedding_model
+        return all_chunks, embeddings
 
 
-def get_relevant_docs(query, docs, embeddings, top_k=3):
-    """Return top_k most relevant documents for the given query."""
-    query_embedding = model.encode(
-        [query], convert_to_numpy=True, normalize_embeddings=True
-    )
-    scores = np.dot(embeddings, query_embedding.T).squeeze()
-    top_indices = np.argsort(scores)[::-1][:top_k]
-    return [docs[i] for i in top_indices]
+class RetrievalAgent:
+    """
+    Agent that retrieves the most relevant chunks for a given query or placeholder
+    from the vector store (embeddings).
+    """
+
+    def __init__(self, chunks: List[str], embeddings: np.ndarray):
+        self.chunks = chunks
+        self.embeddings = embeddings
+
+    def run(self, query: str, top_k: int = 3) -> List[str]:
+        """
+        Returns the top_k most relevant chunks for the given query using cosine similarity.
+        """
+        # Use the same embedding model or method to encode the query
+        query_embedding = openai_embeddings([query])  # or embedding_model.encode([...])
+        query_embedding = query_embedding[0]  # just the single vector
+
+        scores = np.dot(self.embeddings, query_embedding)
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        return [self.chunks[i] for i in top_indices]
 
 
-def generate_llm_content(placeholder, instructions, references, max_retries=2):
-    """Use the LLM to generate content for a given placeholder."""
-    system_prompt = (
-        "You are a helpful assistant that uses the provided references "
-        "to produce well-structured, contextually relevant text matching the provided instructions."
-    )
+class LLMContentAgent:
+    """
+    Agent that, given a placeholder label, instructions, and relevant reference chunks,
+    calls the LLM to generate the fill-in text.
+    """
 
-    user_prompt = f"""
+    def __init__(self, model_name=OPENAI_MODEL):
+        self.model_name = model_name
+
+    def run(
+        self, placeholder: str, instructions: str, references: List[str], max_retries=2
+    ) -> str:
+        """
+        Generate content for a given placeholder using the provided references and instructions.
+        """
+        system_prompt = (
+            "You are a helpful assistant that uses the provided references "
+            "to produce well-structured, contextually relevant text matching the instructions."
+        )
+
+        user_prompt = f"""
 Placeholder: {placeholder}
 Instructions: {instructions}
 
@@ -109,94 +147,184 @@ Relevant References:
 {chr(10).join(references)}
 
 Please produce a coherent piece of text that fits into the template section.
-If references are not sufficient, provide a best-effort summary or note that no relevant info was found.
+If references are insufficient, provide a best-effort summary or note that more data was not found.
 """
-    for _ in range(max_retries):
-        try:
-            response = openai.ChatCompletion.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.7,
-                max_tokens=500,
-            )
-            content = response.choices[0].message.content.strip()
-            if content:
-                return content
-        except Exception:
-            pass
-    return f"[Warning: No suitable content generated for {placeholder}]"
+
+        for attempt in range(max_retries):
+            try:
+                response = openai.ChatCompletion.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=500,
+                )
+                content = response.choices[0].message.content.strip()
+                if content:
+                    return content
+            except Exception as e:
+                print(f"Error calling LLM (attempt {attempt+1}): {e}")
+        return f"[Warning: No suitable content generated for {placeholder}]"
 
 
-def replace_placeholder_in_paragraph(paragraph, placeholder, new_text):
-    """Replace a placeholder in a single paragraph's text.
-    For more complex formatting, you might need to rebuild runs rather than replacing paragraph.text.
+class TemplateFillingAgent:
     """
-    old_text = paragraph.text
-    new_paragraph_text = old_text.replace("{{" + placeholder + "}}", new_text)
-    paragraph.text = new_paragraph_text
+    Agent that loads a DOCX template, finds all placeholders, and replaces them
+    with the generated content while preserving formatting.
+    """
+
+    def __init__(self, template_path: str):
+        self.template_path = template_path
+
+    def load_template(self) -> Document:
+        """
+        Load the DOCX template.
+        """
+        return Document(self.template_path)
+
+    def extract_placeholders(self, doc: Document) -> List[str]:
+        """
+        Extract all placeholders ({{name}}) from the docx paragraphs and tables.
+        """
+        placeholders = set()
+        # Check paragraphs
+        for p in doc.paragraphs:
+            matches = re.findall(PLACEHOLDER_PATTERN, p.text)
+            for m in matches:
+                placeholders.add(m.strip())
+        # Check tables
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    matches = re.findall(PLACEHOLDER_PATTERN, cell.text)
+                    for m in matches:
+                        placeholders.add(m.strip())
+        return list(placeholders)
+
+    def replace_placeholder_in_paragraph(
+        self, paragraph, placeholder: str, new_text: str
+    ):
+        """
+        Replace a placeholder in a single paragraph.
+        Advanced users may need to manipulate runs for complex formatting.
+        """
+        old_text = paragraph.text
+        placeholder_pattern = "{{" + placeholder + "}}"
+        if placeholder_pattern in old_text:
+            paragraph.text = old_text.replace(placeholder_pattern, new_text)
+
+    def replace_placeholders_in_doc(
+        self, doc: Document, placeholder_to_text: Dict[str, str]
+    ) -> Document:
+        """
+        Replace placeholders in paragraphs and table cells.
+        """
+        # Replace in paragraphs
+        for p in doc.paragraphs:
+            for ph, val in placeholder_to_text.items():
+                self.replace_placeholder_in_paragraph(p, ph, val)
+
+        # Replace in tables
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for ph, val in placeholder_to_text.items():
+                        placeholder_pattern = "{{" + ph + "}}"
+                        if placeholder_pattern in cell.text:
+                            cell.text = cell.text.replace(placeholder_pattern, val)
+        return doc
 
 
-def replace_placeholders_in_doc(doc: Document, placeholder_to_text):
-    """Replace placeholders in the entire DOCX, including tables."""
-    # Replace in paragraphs
-    for p in doc.paragraphs:
-        for ph, val in placeholder_to_text.items():
-            if f"{{{{{ph}}}}}" in p.text:
-                replace_placeholder_in_paragraph(p, ph, val)
-
-    # Replace in tables
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for ph, val in placeholder_to_text.items():
-                    if f"{{{{{ph}}}}}" in cell.text:
-                        cell.text = cell.text.replace("{{" + ph + "}}", val)
-
-    return doc
+################################################
+# Example Helper for Creating Embeddings
+################################################
 
 
-#######################################
-# Main Logic Example
-#######################################
+def openai_embeddings(texts: List[str]) -> np.ndarray:
+    """
+    Simple placeholder function for generating embeddings (using an LLM or
+    another approach). You could replace it with your own logic, or directly
+    use the sentence_transformers/embedding_model below.
+    """
+    # If you're using sentence-transformers globally, you can do:
+    #   return embedding_model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    #
+    # If you're using OpenAI for embeddings:
+    #   - call openai.Embedding.create(...) for each text
+    #
+    # For demo, we'll just return random vectors (not recommended in real usage).
+    # This is to illustrate that you can use a typed function.
+    rng = np.random.default_rng()
+    embedding_dim = 384  # typical dimension for e.g. "all-MiniLM-L6-v2"
+    return rng.random((len(texts), embedding_dim), dtype=np.float32)
+
+
+################################################
+# Orchestration (main pipeline)
+################################################
 
 
 def main():
-    template_path = "template.docx"  # The user-provided DOCX template
-    docs_dir = "input_docs"  # Directory containing input documents
+    # 1. Document ingestion
+    docs_dir = "input_docs"  # Directory with TXT, MD, PDF files
+    ingestion_agent = DocumentIngestionAgent(docs_dir)
+    raw_texts = ingestion_agent.run()
 
-    # Load template
-    template_doc = load_template(template_path)
-    placeholders = extract_placeholders_from_template(template_doc)
-
-    if not placeholders:
+    if not raw_texts:
         print(
-            "No placeholders found in the template. Please add placeholders like {{SectionName}}."
+            "No input documents found. Please place your PDF/TXT/MD files in 'input_docs/'."
         )
         return
 
-    # Load and process input docs (TXT, MD, PDF)
-    docs = load_input_documents(docs_dir)
-    if not docs:
-        print("No input documents found.")
+    # 2. Chunking and Embedding
+    chunking_agent = ChunkingEmbeddingAgent(chunk_size=CHUNK_SIZE)
+    chunks, embeddings = chunking_agent.run(raw_texts)
+
+    # 3. Template filling setup
+    template_path = "template_1.docx"  # The user-provided DOCX template
+    filling_agent = TemplateFillingAgent(template_path)
+
+    # Load the DOCX template
+    try:
+        doc = filling_agent.load_template()
+    except Exception as e:
+        print(f"Error loading template at '{template_path}': {e}")
         return
 
-    embeddings = create_embedding_index(docs)
+    # Extract placeholders
+    placeholders = filling_agent.extract_placeholders(doc)
+    if not placeholders:
+        print(
+            "No placeholders found in the template. Make sure they are in the form {{PlaceholderName}}."
+        )
+        return
 
-    placeholder_to_text = {}
+    # 4. For each placeholder: retrieve context and generate text via LLM
+    retrieval_agent = RetrievalAgent(chunks, embeddings)
+    llm_agent = LLMContentAgent(model_name=OPENAI_MODEL)
+
+    placeholder_to_text: Dict[str, str] = {}
     for ph in placeholders:
-        # Find relevant documents
-        relevant_docs = get_relevant_docs(ph, docs, embeddings, top_k=3)
-        # Generate content via LLM
-        content = generate_llm_content(ph, USER_INSTRUCTIONS, relevant_docs)
+        # a) Retrieve top chunks relevant to the placeholder
+        top_chunks = retrieval_agent.run(ph, top_k=3)
+
+        # If top_chunks are empty or only whitespace, provide fallback
+        if not top_chunks or all(not chunk.strip() for chunk in top_chunks):
+            top_chunks = [
+                "[No references found in the input documents for this topic. "
+                "Please provide a generic or placeholder summary if possible.]"
+            ]
+
+        # b) Generate content with the LLM (which now has fallback instructions)
+        content = llm_agent.run(ph, USER_INSTRUCTIONS, top_chunks)
         placeholder_to_text[ph] = content
 
-    # Insert generated content into the template
-    filled_doc = replace_placeholders_in_doc(template_doc, placeholder_to_text)
+    # 5. Fill the template
+    filled_doc = filling_agent.replace_placeholders_in_doc(doc, placeholder_to_text)
 
-    # Save final output
+    # 6. Save the final DOCX
     output_path = "final_output.docx"
     filled_doc.save(output_path)
     print(f"Document generated and saved to: {output_path}")
